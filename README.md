@@ -37,6 +37,12 @@ If you're in a nix enabled system with flakes, simply move your CSVs to a folder
 
 Otherwise, please download the script, download `playwright` and install playwright browsers and run the script with: `python3 main.py "takeout"`
 
+It will create a folder `out` inside your folder with the `CSVs` where the `gpx` files will be put. It also creates a `merged_all.gpx` with all the places from all lists merged into a single one in that same folder.
+
+If the script is interrupted, it may be run again, it will ask if you wish to override the files that already exist, or if you want to continue from where it left of.
+
+In the end you will get a list with all the Places that failed that you should check/add manually.
+
 ### Options:
 
 - `--debug` - Enable debug logging

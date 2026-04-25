@@ -486,15 +486,28 @@ def main():
                         help='0=headful browser, 1=headless (default: 1)')
     parser.add_argument('--debug', action='store_true', 
                         help='Enable debug logging')
+    parser.add_argument('--log-dir', default=None,
+                        help='Directory to write timestamped log file (optional)')
     args = parser.parse_args()
     
     # Setup logging
     logger = logging.getLogger("csv2gpx")
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
-    
+
+    if args.log_dir:
+        log_path = Path(args.log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fh = logging.FileHandler(log_path / f"conversion_{ts}.log", encoding="utf-8")
+        fh.setFormatter(formatter)
+        fh.setLevel(logging.DEBUG if args.debug else logging.INFO)
+        logger.addHandler(fh)
+        logger.info(f"Logging to file: {log_path / f'conversion_{ts}.log'}")
+
     # Validate directory
     input_dir = Path(args.directory)
     if not input_dir.is_dir():

@@ -760,6 +760,13 @@ def main():
         
         all_entries = []
         all_failed = []
+        run_start = time.time()
+        total_places = sum(
+            max(0, sum(1 for _ in _open_csv_at_header(p)) - 1)
+            for p in csv_files
+        )
+        places_done = 0
+        logger.info(f"Total lieux à traiter (estimation) : {total_places}")
 
         # Process each CSV file
         for idx, csv_path in enumerate(csv_files):
@@ -777,6 +784,58 @@ def main():
             # Use skip_titles only for the resume file
             # Always process each CSV file, but provide any existing titles/coords for that file
             skip_for_this_file = resume_map.get(csv_path.stem, {}) if resume_map else {}
+
+            # Fast resume path:
+            # If every titled row in CSV already has valid coords in existing GPX,
+            # skip reprocessing and avoid rewriting the per-file GPX.
+            if skip_for_this_file:
+                csv_rows = []
+                with _open_csv_at_header(csv_path) as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        title = row.get('Title', '').strip()
+                        if not title:
+                            continue
+                        csv_rows.append({
+                            'title': title,
+                            'note': row.get('Note', '').strip(),
+                            'url': row.get('URL', '').strip(),
+                            'tags': row.get('Tags', '').strip(),
+                            'comment': row.get('Comment', '').strip(),
+                        })
+
+                can_skip_file = len(csv_rows) > 0 and all(
+                    r['title'] in skip_for_this_file
+                    and skip_for_this_file[r['title']]
+                    and skip_for_this_file[r['title']][0] is not None
+                    and skip_for_this_file[r['title']][1] is not None
+                    and skip_for_this_file[r['title']] != (0, 0)
+                    for r in csv_rows
+                )
+
+                if can_skip_file:
+                    resumed_entries = []
+                    for r in csv_rows:
+                        lat, lon = skip_for_this_file[r['title']]
+                        resumed_entries.append({
+                            'title': r['title'],
+                            'note': r['note'],
+                            'url': r['url'],
+                            'tags': r['tags'],
+                            'comment': r['comment'],
+                            'lat': lat,
+                            'lon': lon,
+                        })
+
+                    all_entries.extend(resumed_entries)
+                    places_done += len(csv_rows)
+                    logger.info(
+                        f"Resume skip: {csv_path.name} already complete in existing GPX "
+                        f"({len(csv_rows)} waypoints) — no rewrite"
+                    )
+                    logger.info("")
+                    continue
+
             entries, failed = process_csv_file(
                 csv_path,
                 pw,
@@ -787,7 +846,18 @@ def main():
                 cache_file=cache_file_path,
             )
 
-            
+            places_done += len(entries) + len(failed)
+            if places_done > 0 and run_start:
+                elapsed = time.time() - run_start
+                rate = elapsed / places_done
+                remaining = max(0, total_places - places_done)
+                eta_s = int(rate * remaining)
+                eta_h, eta_m = divmod(eta_s // 60, 60)
+                logger.info(
+                    f"Progression : {places_done}/{total_places} lieux "
+                    f"— ETA : {eta_h}h{eta_m:02d}m"
+                )
+
             if entries:
                 # Create individual GPX file
                 basename = csv_path.stem

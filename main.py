@@ -25,6 +25,36 @@ ACCEPT_SUBSTRINGS = ['accept', 'accept all', 'aceptar', 'aceitar', 'accept all',
 # Global variable to store broken link coordinates
 BROKEN_LINK_COORDS = None
 
+# Shared Playwright browser/context/page reused across the whole run.
+# Goal: spawn a single chromium-headless-shell process per script execution,
+# instead of one per URL (firewall-friendly, much faster).
+_SHARED = {"browser": None, "context": None, "page": None}
+
+
+def _get_shared_page(pw, headless):
+    """Return a (page, context) reusing a single browser for the whole run."""
+    if _SHARED["page"] is None:
+        browser = pw.chromium.launch(headless=headless)
+        context = browser.new_context(locale="en-US")
+        page = context.new_page()
+        _SHARED["browser"] = browser
+        _SHARED["context"] = context
+        _SHARED["page"] = page
+    return _SHARED["page"], _SHARED["context"]
+
+
+def _close_shared_browser():
+    """Close the shared browser at the end of the run."""
+    if _SHARED["browser"] is not None:
+        try:
+            _SHARED["browser"].close()
+        except Exception:
+            pass
+        _SHARED["browser"] = None
+        _SHARED["context"] = None
+        _SHARED["page"] = None
+
+
 def extract_coords(u):
     if not u: return None
     m = AT_RE.search(u)
@@ -75,9 +105,7 @@ def get_broken_link_coords(pw, logger, headless):
     CALIBRATION_TIMESTAMP = time.time()
 
     logger.info("=== Calibrating broken link detector ===")
-    browser = pw.chromium.launch(headless=headless)
-    context = browser.new_context(locale="en-US")
-    page = context.new_page()
+    page, context = _get_shared_page(pw, headless)
     logger.info("Navigating to broken link: %s", BrokenURL)
     
     try:
@@ -95,7 +123,6 @@ def get_broken_link_coords(pw, logger, headless):
         if coords:
             logger.info("Broken link coordinates found: %s", coords)
             BROKEN_LINK_COORDS = coords
-            browser.close()
             return coords
         
         # Try clicking consent buttons
@@ -124,7 +151,6 @@ def get_broken_link_coords(pw, logger, headless):
         time.sleep(2)
     
     logger.warning("Could not extract broken link coordinates after %d attempts", max_attempts)
-    browser.close()
     return None
 
 def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
@@ -133,9 +159,7 @@ def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
     Returns (0, 0) if coordinates match broken link pattern.
     Returns None if timeout or error.
     """
-    browser = pw.chromium.launch(headless=headless)
-    context = browser.new_context(locale="en-US")
-    page = context.new_page()
+    page, context = _get_shared_page(pw, headless)
     
     try:
         page.goto(url, wait_until="networkidle", timeout=60000)
@@ -156,11 +180,9 @@ def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
             # Check if coordinates match broken link
             if BROKEN_LINK_COORDS and coords == BROKEN_LINK_COORDS:
                 logger.warning("BROKEN LINK DETECTED: Coordinates match known broken link pattern")
-                browser.close()
                 return (0, 0)
             
             logger.debug("Valid coords found: %s", coords)
-            browser.close()
             return coords
 
         clicked = False
@@ -202,7 +224,6 @@ def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
 
         if elapsed > timeout:
             logger.warning("Timeout exceeded (%.1fs). Giving up.", elapsed)
-            browser.close()
             return None
 
         time.sleep(2)
@@ -531,14 +552,6 @@ def main():
         
         all_entries = []
         all_failed = []
-        
-        # Calibrate broken link detector
-        headless_bool = bool(args.headless)
-        broken_coords = get_broken_link_coords(pw, logger, headless_bool)
-        if not broken_coords:
-            logger.warning("Could not calibrate broken link detector")
-        else:
-            logger.info(f"=== Broken link detector calibrated: {broken_coords} ===\n")
 
         # Process each CSV file
         for idx, csv_path in enumerate(csv_files):

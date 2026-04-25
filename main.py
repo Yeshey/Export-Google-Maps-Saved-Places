@@ -4,9 +4,9 @@ Converts Google Takeout CSV files to GPX/KML files for Organic Maps import.
 Processes all CSV files in a directory, extracts coordinates using Playwright,
 and creates individual GPX files plus one merged GPX with all entries.
 """
-import time, argparse, logging, sys, re, os, csv
+import time, argparse, logging, sys, re, os, csv, json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -344,7 +344,143 @@ def parse_existing_gpx_outputs(output_dir):
         return {}
     return existing
 
-def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None):
+
+def load_url_cache(cache_file, logger):
+    """
+    Load URL cache from JSON file.
+    Returns: dict {url: {"lat": float, "lon": float, "title": str, "note": str, "tags": str, "comment": str, "updated_at": str}}
+    Backward compatible with old format (no title/note/tags/comment).
+    """
+    if not cache_file:
+        return {}
+
+    cache_path = Path(cache_file)
+    if not cache_path.exists():
+        return {}
+
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    except Exception as e:
+        logger.warning("Could not read cache file %s: %s", cache_path, e)
+        return {}
+
+    if not isinstance(raw, dict):
+        logger.warning("Cache file %s has invalid format (expected object)", cache_path)
+        return {}
+
+    cache = {}
+    for url, val in raw.items():
+        if not isinstance(url, str) or not isinstance(val, dict):
+            continue
+        try:
+            lat = float(val.get("lat"))
+            lon = float(val.get("lon"))
+        except Exception:
+            continue
+        cache[url] = {
+            "lat": lat,
+            "lon": lon,
+            "title": val.get("title", ""),
+            "note": val.get("note", ""),
+            "tags": val.get("tags", ""),
+            "comment": val.get("comment", ""),
+            "updated_at": val.get("updated_at", "")
+        }
+
+    logger.info("Loaded %d cached URL resolution(s) from %s", len(cache), cache_path)
+    return cache
+
+
+def persist_url_cache(cache_file, cache, logger):
+    """Persist URL cache atomically to JSON file. Includes all fields for GPX recovery."""
+    if not cache_file:
+        return
+
+    cache_path = Path(cache_file)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+
+    payload = {
+        url: {
+            "lat": val["lat"],
+            "lon": val["lon"],
+            "title": val.get("title", ""),
+            "note": val.get("note", ""),
+            "tags": val.get("tags", ""),
+            "comment": val.get("comment", ""),
+            "updated_at": val.get("updated_at", "")
+        }
+        for url, val in cache.items()
+    }
+
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp_path, cache_path)
+
+
+def rebuild_gpx_from_cache(cache_file, output_dir, logger):
+    """
+    Reconstruct GPX files from cache JSON in case of crash.
+    Builds one GPX per unique title's first URL occurrence.
+    Returns: number of GPX files created.
+    """
+    if not cache_file:
+        return 0
+
+    cache_path = Path(cache_file)
+    if not cache_path.exists():
+        logger.warning("Cache file not found: %s", cache_path)
+        return 0
+
+    cache = load_url_cache(cache_file, logger)
+    if not cache:
+        logger.warning("Cache is empty")
+        return 0
+
+    logger.info("Rebuilding GPX from cache (%d cached entries)...", len(cache))
+
+    # Group by title to build entries
+    entries = []
+    seen_titles = set()
+
+    for url, val in sorted(cache.items()):
+        title = val.get("title", "").strip()
+        if not title or title in seen_titles:
+            continue
+
+        seen_titles.add(title)
+        lat = val.get("lat")
+        lon = val.get("lon")
+
+        if lat is None or lon is None:
+            continue
+
+        entries.append({
+            "title": title,
+            "note": val.get("note", ""),
+            "url": url,
+            "tags": val.get("tags", ""),
+            "comment": val.get("comment", ""),
+            "lat": lat,
+            "lon": lon
+        })
+
+    if not entries:
+        logger.warning("No valid entries found in cache")
+        return 0
+
+    # Create a single merged GPX from recovered entries
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    recovery_gpx = output_dir / "recovered_from_cache.gpx"
+
+    create_gpx(entries, recovery_gpx)
+    logger.info("Created recovery GPX: %s (%d waypoints)", recovery_gpx, len(entries))
+
+    return 1
+
+def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None, url_cache=None, cache_file=None):
     """
     Process a single CSV file and return list of entries with coordinates.
     existing_titles_coords: dict mapping title -> (lat, lon) read from an existing GPX for this csv (may be None).
@@ -400,6 +536,24 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
                 failed.append(title)
                 continue
 
+            # URL cache lookup first
+            cached = (url_cache or {}).get(url)
+            if cached:
+                cached_lat = cached.get('lat')
+                cached_lon = cached.get('lon')
+                if cached_lat is not None and cached_lon is not None:
+                    logger.info(f"Using cached coords for '{title}': ({cached_lat}, {cached_lon})")
+                    entries.append({
+                        'title': title,
+                        'note': note,
+                        'url': url,
+                        'tags': tags,
+                        'comment': comment,
+                        'lat': cached_lat,
+                        'lon': cached_lon
+                    })
+                    continue
+
             logger.info(f"Fetching coords for: {title}")
             coords = get_coordinates_from_url(url, pw, logger, headless)
 
@@ -420,6 +574,22 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
                     'lon': coords[1]
                 })
                 logger.info(f"✓ '{title}' -> ({coords[0]}, {coords[1]})")
+
+                # Persist each successful URL resolution immediately (with full entry data for recovery)
+                if url_cache is not None:
+                    url_cache[url] = {
+                        "lat": coords[0],
+                        "lon": coords[1],
+                        "title": title,
+                        "note": note,
+                        "tags": tags,
+                        "comment": comment,
+                        "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    }
+                    try:
+                        persist_url_cache(cache_file, url_cache, logger)
+                    except Exception as e:
+                        logger.warning("Could not persist cache file %s: %s", cache_file, e)
 
             time.sleep(1)  # Be nice to Google
 
@@ -488,6 +658,10 @@ def main():
                         help='Enable debug logging')
     parser.add_argument('--log-dir', default=None,
                         help='Directory to write timestamped log file (optional)')
+    parser.add_argument('--cache-file', default=None,
+                        help='Path to JSON cache file for URL->coordinates (optional)')
+    parser.add_argument('--recover-from-cache', action='store_true',
+                        help='Recover GPX from cache file only (ignores CSV files)')
     args = parser.parse_args()
     
     # Setup logging
@@ -508,11 +682,32 @@ def main():
         logger.addHandler(fh)
         logger.info(f"Logging to file: {log_path / f'conversion_{ts}.log'}")
 
-    # Validate directory
+    # Validate directory (needed before resolving default cache path)
     input_dir = Path(args.directory)
     if not input_dir.is_dir():
         logger.error(f"Error: '{input_dir}' is not a directory")
         return 1
+
+    # Cache file path: explicit arg wins, otherwise default to <input_dir>/out/url_coords_cache.json
+    cache_file_path = args.cache_file
+    if not cache_file_path:
+        default_out = input_dir / "out"
+        default_out.mkdir(parents=True, exist_ok=True)
+        cache_file_path = str(default_out / "url_coords_cache.json")
+        logger.info(f"No --cache-file given, defaulting to: {cache_file_path}")
+    else:
+        logger.info(f"Using URL cache file: {cache_file_path}")
+
+    url_cache = load_url_cache(cache_file_path, logger)
+
+    # Recovery mode: rebuild from cache only
+    if args.recover_from_cache:
+        logger.info("=== RECOVERY MODE: Rebuilding GPX from cache ===")
+        output_dir = input_dir / "out"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        count = rebuild_gpx_from_cache(cache_file_path, output_dir, logger)
+        logger.info(f"Recovery complete: {count} GPX file(s) created")
+        return 0
 
     check_structure(input_dir)
 
@@ -582,7 +777,15 @@ def main():
             # Use skip_titles only for the resume file
             # Always process each CSV file, but provide any existing titles/coords for that file
             skip_for_this_file = resume_map.get(csv_path.stem, {}) if resume_map else {}
-            entries, failed = process_csv_file(csv_path, pw, logger, headless_bool, existing_titles_coords=skip_for_this_file)
+            entries, failed = process_csv_file(
+                csv_path,
+                pw,
+                logger,
+                headless_bool,
+                existing_titles_coords=skip_for_this_file,
+                url_cache=url_cache,
+                cache_file=cache_file_path,
+            )
 
             
             if entries:

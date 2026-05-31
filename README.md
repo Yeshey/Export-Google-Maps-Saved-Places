@@ -3,13 +3,13 @@ Script able to convert Google Maps Links to coordinates, this converts Google Sa
 
 # Purpose
 
-Currently, the only tool that I know that converts google takeout my places CSVs to portable formats is: https://www.takeout-tools.com, witch is paid, and only allows 5 conversions for free.  
-There is also [Geo Share](https://github.com/jakubvalenta/geoshare), witch is the best open source tool out there to convert Google Maps links into links capable of being sent and used by other applications. It unfortunately doesn't support converting whole files or the CSVs from Google Takeout (at least for now, you can track [this issue](https://github.com/jakubvalenta/geoshare/issues/167#issuecomment-3387105739) if you're interested)
+Currently, the only tool that I know that converts google takeout my places CSVs to portable formats is: https://www.takeout-tools.com, which is paid, and only allows 5 conversions for free.  
+There is also [Geo Share](https://github.com/jakubvalenta/geoshare), which is the best open source tool out there to convert Google Maps links into links capable of being sent and used by other applications. It unfortunately doesn't support converting whole files or the CSVs from Google Takeout (at least for now, you can track [this issue](https://github.com/jakubvalenta/geoshare/issues/167#issuecomment-3387105739) if you're interested)
 
 Thus, I made this script to help people export their Google Maps Saved Places out of Google Maps and into applications like [Organic Maps](https://github.com/organicmaps/organicmaps), [CoMaps](https://github.com/comaps/comaps), or [OSM](https://github.com/osmandapp/OsmAnd)!
 
 > [!WARNING]  
-> LLMs such as [Calude](https://claude.ai/), [Kimi](https://www.kimi.com/), and [ChatGPT](https://chatgpt.com/) were used extensively to make this script, use at your own risk!
+> LLMs such as [Claude](https://claude.ai/), [Kimi](https://www.kimi.com/), and [ChatGPT](https://chatgpt.com/) were used extensively to make this script, use at your own risk!
 
 # Usage
 

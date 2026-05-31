@@ -343,6 +343,8 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
 
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames:
+            reader.fieldnames = [h.strip() for h in reader.fieldnames]
 
         for row in reader:
             title = row.get('Title', '').strip()

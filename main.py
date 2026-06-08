@@ -341,7 +341,7 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
     # normalize existing map for quick lookup
     existing_map = existing_titles_coords or {}
 
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    with _open_csv_at_header(csv_path) as f:
         reader = csv.DictReader(f)
         if reader.fieldnames:
             reader.fieldnames = [h.strip() for h in reader.fieldnames]
@@ -407,28 +407,53 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
     return entries, failed
 
 
+
+REQUIRED_HEADER = ["Title", "Note", "URL", "Tags", "Comment"]
+
+
+def _open_csv_at_header(csv_path, max_skip=10):
+    """
+    Open a CSV and return a file object positioned at the header row.
+    Tolerates parasitic lines before the header (free-form title, blank lines)
+    that Google Takeout sometimes inserts in named-list exports.
+    Raises ValueError if the header is not found within `max_skip` lines.
+    """
+    f = open(csv_path, 'r', encoding='utf-8', newline='')
+    for _ in range(max_skip):
+        pos = f.tell()
+        line = f.readline()
+        if not line:
+            break
+        try:
+            row = next(csv.reader([line]))
+        except StopIteration:
+            continue
+        if [h.strip() for h in row] == REQUIRED_HEADER:
+            f.seek(pos)
+            return f
+    f.close()
+    raise ValueError(
+        f"Header {REQUIRED_HEADER} not found in first {max_skip} lines of {csv_path}"
+    )
+
 def check_structure(directory):
     """
-    Verify every CSV file in the directory has the exact header:
-    Title,Note,URL,Tags,Comment
+    Verify every CSV file in the directory contains the required header row
+    (Title,Note,URL,Tags,Comment) within its first lines.
     """
-    required = ["Title", "Note", "URL", "Tags", "Comment"]
     offenders = []
 
     for entry in os.listdir(directory):
         if entry.lower().endswith('.csv'):
             csv_path = os.path.join(directory, entry)
-            with open(csv_path, newline='', encoding='utf-8') as f:
-                try:
-                    header = next(csv.reader(f))
-                except StopIteration:
-                    offenders.append(entry)
-                    continue
-                if [h.strip() for h in header] != required:
-                    offenders.append(entry)
+            try:
+                f = _open_csv_at_header(csv_path)
+                f.close()
+            except (ValueError, StopIteration):
+                offenders.append(entry)
 
     if offenders:
-        print("Error: all CSV files must have the header row:", ", ".join(required), file=sys.stderr)
+        print("Error: all CSV files must contain the header row:", ", ".join(REQUIRED_HEADER), file=sys.stderr)
         print("Non-compliant files:", ", ".join(offenders), file=sys.stderr)
         sys.exit(1)
 

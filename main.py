@@ -25,6 +25,36 @@ ACCEPT_SUBSTRINGS = ['accept', 'accept all', 'aceptar', 'aceitar', 'accept all',
 # Global variable to store broken link coordinates
 BROKEN_LINK_COORDS = None
 
+# Shared Playwright browser/context/page reused across the whole run.
+# Goal: spawn a single chromium-headless-shell process per script execution,
+# instead of one per URL (firewall-friendly, much faster).
+_SHARED = {"browser": None, "context": None, "page": None}
+
+
+def _get_shared_page(pw, headless):
+    """Return a (page, context) reusing a single browser for the whole run."""
+    if _SHARED["page"] is None:
+        browser = pw.chromium.launch(headless=headless)
+        context = browser.new_context(locale="en-US")
+        page = context.new_page()
+        _SHARED["browser"] = browser
+        _SHARED["context"] = context
+        _SHARED["page"] = page
+    return _SHARED["page"], _SHARED["context"]
+
+
+def _close_shared_browser():
+    """Close the shared browser at the end of the run."""
+    if _SHARED["browser"] is not None:
+        try:
+            _SHARED["browser"].close()
+        except Exception:
+            pass
+        _SHARED["browser"] = None
+        _SHARED["context"] = None
+        _SHARED["page"] = None
+
+
 def extract_coords(u):
     if not u: return None
     m = AT_RE.search(u)
@@ -75,9 +105,7 @@ def get_broken_link_coords(pw, logger, headless):
     CALIBRATION_TIMESTAMP = time.time()
 
     logger.info("=== Calibrating broken link detector ===")
-    browser = pw.chromium.launch(headless=headless)
-    context = browser.new_context(locale="en-US")
-    page = context.new_page()
+    page, context = _get_shared_page(pw, headless)
     logger.info("Navigating to broken link: %s", BrokenURL)
     
     try:
@@ -95,7 +123,6 @@ def get_broken_link_coords(pw, logger, headless):
         if coords:
             logger.info("Broken link coordinates found: %s", coords)
             BROKEN_LINK_COORDS = coords
-            browser.close()
             return coords
         
         # Try clicking consent buttons
@@ -124,7 +151,6 @@ def get_broken_link_coords(pw, logger, headless):
         time.sleep(2)
     
     logger.warning("Could not extract broken link coordinates after %d attempts", max_attempts)
-    browser.close()
     return None
 
 def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
@@ -133,9 +159,7 @@ def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
     Returns (0, 0) if coordinates match broken link pattern.
     Returns None if timeout or error.
     """
-    browser = pw.chromium.launch(headless=headless)
-    context = browser.new_context(locale="en-US")
-    page = context.new_page()
+    page, context = _get_shared_page(pw, headless)
     
     try:
         page.goto(url, wait_until="networkidle", timeout=60000)
@@ -156,11 +180,9 @@ def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
             # Check if coordinates match broken link
             if BROKEN_LINK_COORDS and coords == BROKEN_LINK_COORDS:
                 logger.warning("BROKEN LINK DETECTED: Coordinates match known broken link pattern")
-                browser.close()
                 return (0, 0)
             
             logger.debug("Valid coords found: %s", coords)
-            browser.close()
             return coords
 
         clicked = False
@@ -202,7 +224,6 @@ def get_coordinates_from_url(url, pw, logger, headless, timeout=60):
 
         if elapsed > timeout:
             logger.warning("Timeout exceeded (%.1fs). Giving up.", elapsed)
-            browser.close()
             return None
 
         time.sleep(2)
@@ -341,7 +362,7 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
     # normalize existing map for quick lookup
     existing_map = existing_titles_coords or {}
 
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    with _open_csv_at_header(csv_path) as f:
         reader = csv.DictReader(f)
         if reader.fieldnames:
             reader.fieldnames = [h.strip() for h in reader.fieldnames]
@@ -407,28 +428,53 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
     return entries, failed
 
 
+
+REQUIRED_HEADER = ["Title", "Note", "URL", "Tags", "Comment"]
+
+
+def _open_csv_at_header(csv_path, max_skip=10):
+    """
+    Open a CSV and return a file object positioned at the header row.
+    Tolerates parasitic lines before the header (free-form title, blank lines)
+    that Google Takeout sometimes inserts in named-list exports.
+    Raises ValueError if the header is not found within `max_skip` lines.
+    """
+    f = open(csv_path, 'r', encoding='utf-8', newline='')
+    for _ in range(max_skip):
+        pos = f.tell()
+        line = f.readline()
+        if not line:
+            break
+        try:
+            row = next(csv.reader([line]))
+        except StopIteration:
+            continue
+        if [h.strip() for h in row] == REQUIRED_HEADER:
+            f.seek(pos)
+            return f
+    f.close()
+    raise ValueError(
+        f"Header {REQUIRED_HEADER} not found in first {max_skip} lines of {csv_path}"
+    )
+
 def check_structure(directory):
     """
-    Verify every CSV file in the directory has the exact header:
-    Title,Note,URL,Tags,Comment
+    Verify every CSV file in the directory contains the required header row
+    (Title,Note,URL,Tags,Comment) within its first lines.
     """
-    required = ["Title", "Note", "URL", "Tags", "Comment"]
     offenders = []
 
     for entry in os.listdir(directory):
         if entry.lower().endswith('.csv'):
             csv_path = os.path.join(directory, entry)
-            with open(csv_path, newline='', encoding='utf-8') as f:
-                try:
-                    header = next(csv.reader(f))
-                except StopIteration:
-                    offenders.append(entry)
-                    continue
-                if [h.strip() for h in header] != required:
-                    offenders.append(entry)
+            try:
+                f = _open_csv_at_header(csv_path)
+                f.close()
+            except (ValueError, StopIteration):
+                offenders.append(entry)
 
     if offenders:
-        print("Error: all CSV files must have the header row:", ", ".join(required), file=sys.stderr)
+        print("Error: all CSV files must contain the header row:", ", ".join(REQUIRED_HEADER), file=sys.stderr)
         print("Non-compliant files:", ", ".join(offenders), file=sys.stderr)
         sys.exit(1)
 
@@ -442,15 +488,28 @@ def main():
                         help='0=headful browser, 1=headless (default: 1)')
     parser.add_argument('--debug', action='store_true', 
                         help='Enable debug logging')
+    parser.add_argument('--log-dir', default=None,
+                        help='Directory to write timestamped log file (optional)')
     args = parser.parse_args()
     
     # Setup logging
     logger = logging.getLogger("csv2gpx")
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
-    
+
+    if args.log_dir:
+        log_path = Path(args.log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fh = logging.FileHandler(log_path / f"conversion_{ts}.log", encoding="utf-8")
+        fh.setFormatter(formatter)
+        fh.setLevel(logging.DEBUG if args.debug else logging.INFO)
+        logger.addHandler(fh)
+        logger.info(f"Logging to file: {log_path / f'conversion_{ts}.log'}")
+
     # Validate directory
     input_dir = Path(args.directory)
     if not input_dir.is_dir():
@@ -508,14 +567,6 @@ def main():
         
         all_entries = []
         all_failed = []
-        
-        # Calibrate broken link detector
-        headless_bool = bool(args.headless)
-        broken_coords = get_broken_link_coords(pw, logger, headless_bool)
-        if not broken_coords:
-            logger.warning("Could not calibrate broken link detector")
-        else:
-            logger.info(f"=== Broken link detector calibrated: {broken_coords} ===\n")
 
         # Process each CSV file
         for idx, csv_path in enumerate(csv_files):

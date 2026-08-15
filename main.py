@@ -284,53 +284,72 @@ def create_gpx(entries, output_path):
 #     with open(output_path, 'w', encoding='utf-8') as f:
 #         f.write(xml_str)
 
-def parse_existing_gpx_outputs(output_dir):
+def parse_gpx_file(gpx_path):
     """
-    Parse any existing .gpx files in output_dir and return a mapping:
-      { basename_without_ext: { title -> (lat, lon) } }
-
-    This lets the script know which titles are already present and with which coords.
+    Parse a single .gpx file and return a list of entries.
+    Each entry is a dict with: title, note, url, tags, comment, lat, lon
+    Missing/optional fields are set to empty strings; coords default to None.
     """
-    existing = {}
+    entries = []
     try:
-        for gpx_file in Path(output_dir).glob("*.gpx"):
-            basename = gpx_file.stem
-            existing.setdefault(basename, {})
-            try:
-                tree = ET.parse(gpx_file)
-                root = tree.getroot()
-                # GPX namespace handling: support no-namespace and default GPX namespace
-                ns = {'default': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
-                # find all wpt elements
-                for wpt in root.findall('.//{http://www.topografix.com/GPX/1/1}wpt') if ns else root.findall('.//wpt'):
-                    name_elem = wpt.find('{http://www.topografix.com/GPX/1/1}name') if ns else wpt.find('name')
-                    lat = wpt.get('lat')
-                    lon = wpt.get('lon')
-                    if name_elem is None:
-                        continue
-                    title = (name_elem.text or "").strip()
-                    try:
-                        latf = float(lat) if lat is not None else None
-                        lonf = float(lon) if lon is not None else None
-                    except Exception:
-                        latf = None
-                        lonf = None
-                    existing[basename][title] = (latf, lonf)
-            except Exception:
-                # if parsing fails, ignore this file but continue
-                continue
-    except Exception:
-        return {}
-    return existing
+        tree = ET.parse(gpx_path)
+        root = tree.getroot()
+        # GPX namespace handling: support no-namespace and default GPX namespace
+        has_ns = '}' in root.tag
+        wpt_xpath = './/{http://www.topografix.com/GPX/1/1}wpt' if has_ns else './/wpt'
+        name_tag = '{http://www.topografix.com/GPX/1/1}name' if has_ns else 'name'
+        desc_tag = '{http://www.topografix.com/GPX/1/1}desc' if has_ns else 'desc'
 
-def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None):
+        for wpt in root.findall(wpt_xpath):
+            name_elem = wpt.find(name_tag)
+            if name_elem is None:
+                continue
+            title = (name_elem.text or "").strip()
+            if not title:
+                continue
+            try:
+                lat = float(wpt.get('lat'))
+                lon = float(wpt.get('lon'))
+            except Exception:
+                lat = None
+                lon = None
+
+            note = url = tags = comment = ""
+            desc_elem = wpt.find(desc_tag)
+            if desc_elem is not None and desc_elem.text:
+                for line in desc_elem.text.splitlines():
+                    if line.startswith("Note: "):
+                        note = line[len("Note: "):]
+                    elif line.startswith("Tags: "):
+                        tags = line[len("Tags: "):]
+                    elif line.startswith("Comment: "):
+                        comment = line[len("Comment: "):]
+                    elif line.startswith("URL: "):
+                        url = line[len("URL: "):]
+
+            entries.append({
+                'title': title,
+                'note': note,
+                'url': url,
+                'tags': tags,
+                'comment': comment,
+                'lat': lat,
+                'lon': lon
+            })
+    except Exception:
+        return []
+    return entries
+
+
+
+def process_csv_file(csv_path, pw, logger, headless, output_path=None, resume=False):
     """
     Process a single CSV file and return list of entries with coordinates.
-    existing_titles_coords: dict mapping title -> (lat, lon) read from an existing GPX for this csv (may be None).
-    Behavior:
-      - If title exists in existing_titles_coords and has valid coords (not None and not (0,0)),
-        use those coords and do NOT fetch.
-      - Otherwise attempt to fetch coords via get_coordinates_from_url.
+
+    If output_path is provided, the GPX file is updated incrementally after each
+    successful coordinate lookup. If resume is True, any waypoints already present
+    in output_path are loaded first and skipped during CSV processing.
+
     Returns: (entries_list, failed_titles_list)
     """
     entries = []
@@ -338,8 +357,20 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
 
     logger.info(f"Processing CSV: {csv_path}")
 
-    # normalize existing map for quick lookup
-    existing_map = existing_titles_coords or {}
+    if output_path:
+        if resume and output_path.exists():
+            entries = parse_gpx_file(output_path)
+            logger.info(f"Resuming from {output_path}: loaded {len(entries)} existing waypoints")
+        elif output_path.exists():
+            # Overwrite mode: remove stale output so the new file is built from scratch
+            try:
+                output_path.unlink()
+                logger.info(f"Removed stale output: {output_path}")
+            except Exception as e:
+                logger.warning(f"Could not remove {output_path}: {e}")
+
+    # Track titles already present in the output file to avoid re-fetching
+    processed_titles = {e['title'] for e in entries}
 
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -360,23 +391,10 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
                     logger.warning(f"Skipping row without title in {csv_path}")
                 continue
 
-            # If the title already exists in an existing GPX and has valid coordinates, reuse them
-            if title in existing_map:
-                latlon = existing_map[title]
-                if latlon and latlon[0] is not None and latlon[1] is not None and (latlon != (0, 0)):
-                    logger.info(f"Using existing coords for '{title}' from GPX: ({latlon[0]}, {latlon[1]})")
-                    entries.append({
-                        'title': title,
-                        'note': note,
-                        'url': url,
-                        'tags': tags,
-                        'comment': comment,
-                        'lat': latlon[0],
-                        'lon': latlon[1]
-                    })
-                    continue
-                else:
-                    logger.info(f"Title '{title}' present in GPX but coords are missing/invalid -> will attempt fetch")
+            # If the title is already present in the output GPX, skip it
+            if title in processed_titles:
+                logger.info(f"Skipping '{title}': already present in {output_path}")
+                continue
 
             # If no URL, cannot fetch
             if not url:
@@ -394,7 +412,7 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
                 logger.warning(f"Broken link detected for '{title}'")
                 failed.append(title)
             else:
-                entries.append({
+                entry = {
                     'title': title,
                     'note': note,
                     'url': url,
@@ -402,8 +420,15 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
                     'comment': comment,
                     'lat': coords[0],
                     'lon': coords[1]
-                })
+                }
+                entries.append(entry)
+                processed_titles.add(title)
                 logger.info(f"✓ '{title}' -> ({coords[0]}, {coords[1]})")
+
+                # Persist progress immediately
+                if output_path:
+                    create_gpx(entries, output_path)
+                    logger.info(f"  Saved progress to {output_path} ({len(entries)} waypoints)")
 
             time.sleep(1)  # Be nice to Google
 
@@ -475,28 +500,17 @@ def main():
     
     logger.info(f"Found {len(csv_files)} CSV file(s)")
     
-    # Check for existing output files
-    start_index = 0
-    resume_titles = set()
-    resume_map = {}
-    
+    # Check for existing output files and decide whether to resume
+    resume = False
     if output_dir.exists():
         existing_files = list(output_dir.glob("*.gpx"))
         if existing_files:
             print(f"\nFound {len(existing_files)} existing GPX file(s) in {output_dir}")
             response = input("Override existing files (o) or continue where left off (c)? [o/c]: ").strip().lower()
-            
             if response == 'c':
-                # Build per-file map of existing titles -> coords
-                existing_map = parse_existing_gpx_outputs(output_dir)
-                if existing_map:
-                    # resume_map structure: { csv_basename: { title: (lat, lon), ... }, ... }
-                    resume_map = existing_map
-                    total_entries = sum(len(v) for v in existing_map.values())
-                    logger.info(f"Resuming using existing outputs; found {total_entries} entries across {len(existing_map)} GPX file(s)")
-                else:
-                    logger.info("No existing GPX contents detected; starting from scratch")
-
+                resume = True
+                total_entries = sum(len(parse_gpx_file(f)) for f in existing_files)
+                logger.info(f"Resuming using existing outputs; found {total_entries} entries across {len(existing_files)} GPX file(s)")
             else:
                 logger.info("Will override existing files")
 
@@ -508,55 +522,37 @@ def main():
             logger.warning("Could not calibrate broken link detector")
         else:
             logger.info(f"=== Broken link detector calibrated: {broken_coords} ===\n")
-        
+
         all_entries = []
         all_failed = []
-        
-        # Calibrate broken link detector
-        headless_bool = bool(args.headless)
-        broken_coords = get_broken_link_coords(pw, logger, headless_bool)
-        if not broken_coords:
-            logger.warning("Could not calibrate broken link detector")
-        else:
-            logger.info(f"=== Broken link detector calibrated: {broken_coords} ===\n")
 
         # Process each CSV file
         for idx, csv_path in enumerate(csv_files):
-            if idx < start_index:
-                logger.info(f"Skipping already completed file: {csv_path.name}")
-                continue
-            
             # Check if recalibration is needed
             if CALIBRATION_TIMESTAMP and (time.time() - CALIBRATION_TIMESTAMP) > CALIBRATION_VALIDITY_SECONDS:
                 logger.info("Calibration expired (>5 min), recalibrating...")
                 broken_coords = get_broken_link_coords(pw, logger, headless_bool)
                 if broken_coords:
                     logger.info(f"Recalibrated: {broken_coords}\n")
-            
-            # Use skip_titles only for the resume file
-            # Always process each CSV file, but provide any existing titles/coords for that file
-            skip_for_this_file = resume_map.get(csv_path.stem, {}) if resume_map else {}
-            entries, failed = process_csv_file(csv_path, pw, logger, headless_bool, existing_titles_coords=skip_for_this_file)
 
-            
+            basename = csv_path.stem
+            gpx_path = output_dir / f"{basename}.gpx"
+            entries, failed = process_csv_file(csv_path, pw, logger, headless_bool, output_path=gpx_path, resume=resume)
+
             if entries:
-                # Create individual GPX file
-                basename = csv_path.stem
-                gpx_path = output_dir / f"{basename}.gpx"
-                create_gpx(entries, gpx_path)
-                logger.info(f"✓ Created: {gpx_path} ({len(entries)} waypoints)")
-                
+                logger.info(f"✓ Finalized: {gpx_path} ({len(entries)} waypoints)")
+
                 # # Uncomment to also create KML files:
                 # kml_path = output_dir / f"{basename}.kml"
                 # create_kml(entries, kml_path)
                 # logger.info(f"✓ Created: {kml_path}")
-                
+
                 all_entries.extend(entries)
-            
+
             if failed:
                 logger.warning(f"Failed entries from {csv_path.name}: {', '.join(failed)}")
                 all_failed.extend(failed)
-            
+
             logger.info("")  # Blank line between files
         
         # Create merged GPX with all entries

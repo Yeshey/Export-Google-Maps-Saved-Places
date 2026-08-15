@@ -354,7 +354,10 @@ def process_csv_file(csv_path, pw, logger, headless, existing_titles_coords=None
             comment = row.get('Comment', '').strip()
 
             if not title:
-                logger.warning(f"Skipping row without title in {csv_path}")
+                if not (note or url or tags or comment):
+                    logger.debug(f"Skipping blank row in {csv_path}")
+                else:
+                    logger.warning(f"Skipping row without title in {csv_path}")
                 continue
 
             # If the title already exists in an existing GPX and has valid coordinates, reuse them

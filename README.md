@@ -1,5 +1,5 @@
 # Export-Google-Maps-Saved-Places
-Script able to convert Google Maps Links to coordinates, this converts Google Saved Places CSVs from Google takeout into GPX format witch can be imported into Organic Maps, OSM, CoMaps, etc.
+Script able to convert Google Maps Links to coordinates, this converts Google Saved Places CSVs from Google takeout into GPX format which can be imported into Organic Maps, OSM, CoMaps, etc.
 
 # Purpose
 
